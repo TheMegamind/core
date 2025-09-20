@@ -41,6 +41,11 @@
       "surround_mode": {
         "default": "mdi:music-note-plus"
       }
+    },
+    "number": {
+      "group_volume": {
+        "default": "mdi:volume-high"
+      }
     }
   },
   "services": {
