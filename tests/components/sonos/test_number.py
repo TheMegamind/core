@@ -19,9 +19,8 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
 
-from .conftest import MockSoCo
-
 from tests.common import SnapshotAssertion, async_fire_time_changed
+from .conftest import MockSoCo
 
 CROSSOVER_ENTITY = "number.zone_a_sub_crossover_frequency"
 GROUP_VOLUME_ENTITY_ID = "number.zone_a_group_volume"
