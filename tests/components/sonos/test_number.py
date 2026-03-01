@@ -1,26 +1,24 @@
 """Tests for the Sonos number platform."""
 
 from contextlib import suppress
-from datetime import timedelta
 from unittest.mock import MagicMock, PropertyMock, patch
 
 from soco.exceptions import SoCoException
 
 from homeassistant.components.number import DOMAIN as NUMBER_DOMAIN, SERVICE_SET_VALUE
 from homeassistant.components.sonos.const import (
-    SONOS_GROUP_VOLUME_REFRESHED,
     SONOS_SPEAKER_ACTIVITY,
     SONOS_STATE_UPDATED,
 )
-from homeassistant.components.sonos.number import GROUP_VOLUME_REFRESH_DELAY
 from homeassistant.const import ATTR_ENTITY_ID, STATE_UNKNOWN, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.util import dt as dt_util
+from homeassistant.helpers.entity_component import async_update_entity
 
-from tests.common import SnapshotAssertion, async_fire_time_changed
 from .conftest import MockSoCo
+
+from tests.common import SnapshotAssertion
 
 CROSSOVER_ENTITY = "number.zone_a_sub_crossover_frequency"
 GROUP_VOLUME_ENTITY_ID = "number.zone_a_group_volume"
@@ -124,66 +122,68 @@ async def _setup_numbers_only(async_setup_sonos) -> None:
         await async_setup_sonos()
 
 
-def _force_grouped(soco: MockSoCo) -> str:
-    """Make the mock SoCo appear as grouped (>=2 members) with valid attrs; return gid."""
+def _force_grouped(soco: MockSoCo, *, coordinator_uid: str | None = None) -> str:
+    """Make the mock SoCo appear as grouped (>=2 members) with valid attrs; return gid.
+
+    coordinator_uid:
+      - None/default: coordinator is this soco (normal "coordinator" case)
+      - non-matching uid: coordinator is another visible member with that uid
+    """
     with suppress(AttributeError):
+        coord_uid = soco.uid if coordinator_uid is None else coordinator_uid
+
         # Build or normalize the group object
         if getattr(soco, "group", None) is None or isinstance(
             getattr(type(soco), "group", None), PropertyMock
         ):
             grp = MagicMock()
             grp.uid = "G-TEST"
-            # Coordinator stub
-            coord = MagicMock()
-            coord.uid = soco.uid
-            grp.coordinator = coord
-            # Second member must have uid and is_visible
+
             member2 = MagicMock()
-            member2.uid = "M-TEST"
+            member2.uid = "M-TEST" if coord_uid == soco.uid else coord_uid
             member2.is_visible = True
+
+            grp.coordinator = soco if coord_uid == soco.uid else member2
             grp.members = [soco, member2]
             type(soco).group = PropertyMock(return_value=grp)
         else:
-            # If group object already exists, make sure required attrs are present
             if not getattr(soco.group, "uid", None):
                 soco.group.uid = "G-TEST"
-            if not getattr(soco.group, "coordinator", None):
-                coord = MagicMock()
-                coord.uid = soco.uid
-                soco.group.coordinator = coord
-            # Always ensure a second visible member
+
             member2 = MagicMock()
-            member2.uid = "M-TEST"
+            member2.uid = "M-TEST" if coord_uid == soco.uid else coord_uid
             member2.is_visible = True
             soco.group.members = [soco, member2]
+            soco.group.coordinator = soco if coord_uid == soco.uid else member2
+
     return soco.group.uid
+
+
+async def _refresh_group_volume_entity(hass: HomeAssistant) -> None:
+    """Force the group-volume entity to refresh via HA's update pipeline."""
+    await async_update_entity(hass, GROUP_VOLUME_ENTITY_ID)
+    await hass.async_block_till_done()
 
 
 async def test_group_volume_sets_backend_and_updates_state(
     hass: HomeAssistant, async_setup_sonos, soco: MockSoCo
 ) -> None:
-    """Setting 33 writes group.volume=33; HA state updates after activity event."""
-    # Make it grouped before the platform sets up so subscriptions bind to a real gid
+    """Setting 33 writes group.volume=33; HA state updates after refresh."""
     _force_grouped(soco)
     await _setup_numbers_only(async_setup_sonos)
 
     await hass.services.async_call(
         NUMBER_DOMAIN,
         SERVICE_SET_VALUE,
-        {"entity_id": GROUP_VOLUME_ENTITY_ID, "value": 33},
+        {ATTR_ENTITY_ID: GROUP_VOLUME_ENTITY_ID, "value": 33},
         blocking=True,
     )
     assert soco.group.volume == 33
 
-    # State updates on activity (refresh is scheduled -> advance time)
     async_dispatcher_send(hass, SONOS_SPEAKER_ACTIVITY, "test")
     await hass.async_block_till_done()
-    async_fire_time_changed(
-        hass, dt_util.utcnow() + timedelta(seconds=GROUP_VOLUME_REFRESH_DELAY + 0.1)
-    )
-    await hass.async_block_till_done()
+    await _refresh_group_volume_entity(hass)
 
-    # Verify HA state reflects the new value
     state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
     assert state is not None
     assert int(float(state.state)) == 33
@@ -196,57 +196,13 @@ async def test_group_volume_rounds_in_range(
     _force_grouped(soco)
     await _setup_numbers_only(async_setup_sonos)
 
-    # In-range rounding: 49.5 -> round(49.5) == 50
     await hass.services.async_call(
         NUMBER_DOMAIN,
         SERVICE_SET_VALUE,
-        {"entity_id": GROUP_VOLUME_ENTITY_ID, "value": 49.5},
+        {ATTR_ENTITY_ID: GROUP_VOLUME_ENTITY_ID, "value": 49.5},
         blocking=True,
     )
     assert soco.group.volume == 50
-
-
-async def test_group_volume_updates_on_activity(
-    hass: HomeAssistant,
-    async_setup_sonos,
-    soco: MockSoCo,
-) -> None:
-    """Group volume updates when a fresh coordinator value is fanned out."""
-    soco.group = MagicMock()
-    gid = _force_grouped(soco)
-    soco.group.uid = gid
-
-    await _setup_numbers_only(async_setup_sonos)
-
-    # Simulate coordinator fan-out
-    async_dispatcher_send(hass, f"{SONOS_GROUP_VOLUME_REFRESHED}-{gid}", (gid, 55))
-    await hass.async_block_till_done()
-
-    # Verify state updated from fan-out
-    state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
-    assert state is not None
-    assert int(float(state.state)) == 55
-
-
-async def test_group_volume_fallback_polling(
-    hass: HomeAssistant,
-    async_setup_sonos,
-    soco: MockSoCo,
-) -> None:
-    """Group volume updates when a (simulated) coordinator fan-out occurs."""
-    soco.group = MagicMock()
-    gid = _force_grouped(soco)
-    soco.group.uid = gid
-
-    await _setup_numbers_only(async_setup_sonos)
-
-    async_dispatcher_send(hass, f"{SONOS_GROUP_VOLUME_REFRESHED}-{gid}", (gid, 33))
-    await hass.async_block_till_done()
-
-    # Verify state updated from fallback polling
-    state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
-    assert state is not None
-    assert int(float(state.state)) == 33
 
 
 async def test_group_volume_ungrouped_sets_player_volume(
@@ -255,11 +211,10 @@ async def test_group_volume_ungrouped_sets_player_volume(
     """When ungrouped, the number mirrors player RenderingControl volume."""
     await _setup_numbers_only(async_setup_sonos)
 
-    # Default fixtures are single-member → ungrouped path
     await hass.services.async_call(
         NUMBER_DOMAIN,
         SERVICE_SET_VALUE,
-        {"entity_id": GROUP_VOLUME_ENTITY_ID, "value": 27},
+        {ATTR_ENTITY_ID: GROUP_VOLUME_ENTITY_ID, "value": 27},
         blocking=True,
     )
     assert soco.volume == 27
@@ -274,66 +229,11 @@ async def test_group_volume_number_metadata(
     """Test basic state and attributes (snapshot)."""
     await _setup_numbers_only(async_setup_sonos)
 
-    # Registry entry snapshot
     entity_entry = entity_registry.async_get(GROUP_VOLUME_ENTITY_ID)
     assert entity_entry == snapshot(name=f"{entity_entry.entity_id}-entry")
 
-    # State snapshot
     state = hass.states.get(entity_entry.entity_id)
     assert state == snapshot(name=f"{entity_entry.entity_id}-state")
-
-
-async def test_group_fanout_unsubscribe_and_resubscribe_on_group_change(
-    hass: HomeAssistant,
-    async_setup_sonos,
-    soco: MockSoCo,
-) -> None:
-    """When group uid changes, entity rebinds; polling refresh reflects new group volume."""
-    # Start grouped with deterministic G-1 and bring up the platform
-    gid1 = _force_grouped(soco)
-    soco.group.uid = "G-1"
-    gid1 = "G-1"
-
-    await _setup_numbers_only(async_setup_sonos)
-
-    # Prove we are subscribed and state reflects initial fanout to G-1
-    soco.group.volume = 11
-    async_dispatcher_send(hass, f"{SONOS_GROUP_VOLUME_REFRESHED}-{gid1}", (gid1, 11))
-    await hass.async_block_till_done()
-    state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
-    assert state is not None and int(float(state.state)) == 11
-
-    # Patch SoCo.group (public API) to a new object with uid G-2
-    member2 = MagicMock()
-    member2.uid = "M-TEST"
-    member2.is_visible = True
-
-    new_group = MagicMock()
-    new_group.uid = "G-2"
-    new_group.coordinator = soco.group.coordinator
-    new_group.members = [soco, member2]
-    new_group.volume = 66
-    type(soco).group = PropertyMock(return_value=new_group)
-
-    # Notify topology change & let the entity schedule its delayed refresh
-    async_dispatcher_send(hass, f"{SONOS_STATE_UPDATED}-{soco.uid}")
-    await hass.async_block_till_done()
-    async_fire_time_changed(
-        hass, dt_util.utcnow() + timedelta(seconds=GROUP_VOLUME_REFRESH_DELAY + 0.1)
-    )
-    await hass.async_block_till_done()
-
-    # Drive the refresh path used by the integration after activity
-    async_dispatcher_send(hass, SONOS_SPEAKER_ACTIVITY, "topology-change")
-    await hass.async_block_till_done()
-    async_fire_time_changed(
-        hass, dt_util.utcnow() + timedelta(seconds=GROUP_VOLUME_REFRESH_DELAY + 0.1)
-    )
-    await hass.async_block_till_done()
-
-    # State should now reflect the new group's volume (66)
-    state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
-    assert state is not None and int(float(state.state)) == 66
 
 
 async def test_group_volume_exception(
@@ -345,22 +245,17 @@ async def test_group_volume_exception(
 
     await _setup_numbers_only(async_setup_sonos)
 
+    await _refresh_group_volume_entity(hass)
+
     state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
     assert state is not None
     assert state.state == STATE_UNKNOWN
 
 
-async def test_group_volume_rebinds_on_topology_change(
+async def test_group_volume_refreshes_on_topology_change(
     hass: HomeAssistant, async_setup_sonos, soco: MockSoCo
 ) -> None:
-    """Verify group volume entity rebinds when topology (group UID / coord UID) changes."""
-    await async_setup_sonos()
-
-    # Ensure entity exists
-    state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
-    assert state is not None
-
-    # Initial group with 2 members
+    """Verify group volume updates when group object/volume changes."""
     member2 = MagicMock()
     member2.uid = "M-2"
     member2.is_visible = True
@@ -372,28 +267,42 @@ async def test_group_volume_rebinds_on_topology_change(
     initial_group.volume = 15
     type(soco).group = PropertyMock(return_value=initial_group)
 
-    # Trigger HA update to register/refresh state
-    async_dispatcher_send(hass, f"{SONOS_STATE_UPDATED}-{soco.uid}")
-    await hass.async_block_till_done()
+    await _setup_numbers_only(async_setup_sonos)
 
-    # Change topology: new gid/coord and volume
+    await _refresh_group_volume_entity(hass)
+
+    state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
+    assert state is not None
+    assert int(float(state.state)) == 15
+
     new_group = MagicMock()
     new_group.uid = "G-99"
     new_group.coordinator = soco
-    new_group.coordinator.uid = "C-99"
     new_group.members = [soco, member2]
     new_group.volume = 42
     type(soco).group = PropertyMock(return_value=new_group)
 
-    # Trigger update → entity schedules a delayed refresh; advance time to run it
     async_dispatcher_send(hass, f"{SONOS_STATE_UPDATED}-{soco.uid}")
     await hass.async_block_till_done()
-    async_fire_time_changed(
-        hass, dt_util.utcnow() + timedelta(seconds=GROUP_VOLUME_REFRESH_DELAY + 0.1)
-    )
-    await hass.async_block_till_done()
+    await _refresh_group_volume_entity(hass)
 
-    # Entity state should now reflect the new group volume
     state = hass.states.get(GROUP_VOLUME_ENTITY_ID)
     assert state is not None
     assert int(float(state.state)) == 42
+
+
+async def test_group_volume_set_value_soco_exception_on_group_read(
+    hass: HomeAssistant, async_setup_sonos, soco: MockSoCo
+) -> None:
+    """SoCoException while determining grouping aborts the write gracefully."""
+    _force_grouped(soco)
+    await _setup_numbers_only(async_setup_sonos)
+
+    type(soco).group = PropertyMock(side_effect=SoCoException("group read error"))
+
+    await hass.services.async_call(
+        NUMBER_DOMAIN,
+        SERVICE_SET_VALUE,
+        {ATTR_ENTITY_ID: GROUP_VOLUME_ENTITY_ID, "value": 50},
+        blocking=True,
+    )
